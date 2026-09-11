@@ -72,7 +72,7 @@ import kotlinx.coroutines.delay
 // ChatScreen.kt
 
 // 开启内部图片的固定密码
-private const val INTERNAL_IMAGE_PASSWORD = "123514"
+private const val INTERNAL_IMAGE_PASSWORD = "123321"
 
 @Composable
 fun ChatScreen(inference: LlamaInference) {
