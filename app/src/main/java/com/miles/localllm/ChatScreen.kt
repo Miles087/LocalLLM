@@ -168,7 +168,9 @@ fun ChatScreen(inference: LlamaInference) {
                         Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                     )
                 }
-                imageUris = moveImagesToInternal(context, it)
+                moveImagesToInternal(context, it)
+                // 显示内部目录全量（原有 + 新移入），而非仅本次复制的文件
+                imageUris = loadInternalImages()
                 imageIndex = 0
                 imageDirName = "应用内部目录"
                 // 移入后切到内部来源；显示图片需通过开关输密码开启
@@ -430,7 +432,7 @@ fun ChatScreen(inference: LlamaInference) {
                                     onCheckedChange = { moveToInternal = it }
                                 )
                                 Text(
-                                    text = "移动到应用目录（复制进内部目录并删除原文件）",
+                                    text = "移入应用目录（追加到内部目录并删除原文件）",
                                     style = MaterialTheme.typography.labelMedium
                                 )
                             }
@@ -915,12 +917,10 @@ private fun listImagesInTree(context: Context, treeUri: Uri): List<Uri> {    val
     return results.sortedBy { it.first }.map { it.second }
 }
 
-// 把 SAF 目录树里的图片复制进应用内部目录（files/images），复制成功后删除原文件。
-// 返回内部目录文件的 Uri 列表（file://  scheme，应用内可直接用）。
+// 把 SAF 目录树里的图片复制进应用内部目录（files/images），追加到已有图片，同名文件直接覆盖。
+// 复制成功后删除原文件。返回内部目录文件的 Uri 列表（file://  scheme，应用内可直接用）。
 private fun moveImagesToInternal(context: Context, treeUri: Uri): List<Uri> {
     val internalDir = java.io.File(context.filesDir, "images")
-    // 清空旧的内部图片，避免和新导入的混在一起
-    internalDir.listFiles()?.forEach { it.delete() }
     internalDir.mkdirs()
 
     val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
@@ -945,10 +945,13 @@ private fun moveImagesToInternal(context: Context, treeUri: Uri): List<Uri> {
     }
 
     val copied = mutableListOf<java.io.File>()
+    var overwritten = 0
     results.sortedBy { it.first }.forEach { (name, docUri) ->
         runCatching {
+            val dest = java.io.File(internalDir, name)
+            // 同名文件直接覆盖
+            if (dest.exists()) overwritten++
             context.contentResolver.openInputStream(docUri)?.use { input ->
-                val dest = java.io.File(internalDir, name)
                 dest.outputStream().use { output -> input.copyTo(output) }
                 copied.add(dest)
             }
@@ -969,7 +972,13 @@ private fun moveImagesToInternal(context: Context, treeUri: Uri): List<Uri> {
             }
         }
     }
-    Log.d("MyLocalLLM", "ChatScreen: 移入内部目录完成, 复制=${copied.size}, 删除原文件=$deleted")
+    val failed = results.size - copied.size
+    Log.d("MyLocalLLM", "ChatScreen: 追加到内部目录完成, 目录中共找到=${results.size}, 复制=${copied.size}, 其中覆盖同名=$overwritten, 失败=$failed, 删除原文件=$deleted")
+    Toast.makeText(
+        context,
+        "找到 ${results.size} 张，复制 ${copied.size} 张（覆盖同名 $overwritten 张），失败 $failed 张",
+        Toast.LENGTH_LONG
+    ).show()
 
     return copied.sortedBy { it.name }.map { Uri.fromFile(it) }
 }
