@@ -54,6 +54,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.*
 import androidx.compose.ui.geometry.Offset
@@ -67,7 +68,10 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.miles.localllm.operator.LlamaInference
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 // ChatScreen.kt
 
@@ -157,6 +161,7 @@ fun ChatScreen(inference: LlamaInference) {
     // 图片目录选择器（SAF 目录授权，可持久访问）
     // moveToInternal=true 时把目录内图片移入应用内部目录，否则直接读取该目录
     var moveToInternal by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     val dirPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { uri: Uri? ->
@@ -168,14 +173,18 @@ fun ChatScreen(inference: LlamaInference) {
                         Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                     )
                 }
-                moveImagesToInternal(context, it)
-                // 显示内部目录全量（原有 + 新移入），而非仅本次复制的文件
-                imageUris = loadInternalImages()
-                imageIndex = 0
-                imageDirName = "应用内部目录"
-                // 移入后切到内部来源；显示图片需通过开关输密码开启
-                useInternalImages = true
-                imgPrefs.edit().putBoolean("image_source_internal", true).apply()
+                // 复制+删除是大量文件 I/O，放到 IO 线程执行，避免卡住 UI 甚至 ANR
+                scope.launch {
+                    withContext(Dispatchers.IO) { moveImagesToInternal(context, it) }
+                    // 显示内部目录全量（原有 + 新移入），而非仅本次复制的文件
+                    imageUris = loadInternalImages()
+                    imageIndex = 0
+                    imageDirName = "应用内部目录"
+                    // 移入后切到内部来源；显示图片需通过开关输密码开启
+                    useInternalImages = true
+                    imgPrefs.edit().putBoolean("image_source_internal", true).apply()
+                    Log.d("MyLocalLLM", "ChatScreen: 图片目录=$imageDirName, 共 ${imageUris.size} 张, moveToInternal=true")
+                }
             } else {
                 runCatching {
                     context.contentResolver.takePersistableUriPermission(
@@ -188,8 +197,8 @@ fun ChatScreen(inference: LlamaInference) {
                 // 选中外部目录即显示图片
                 showImages = true
                 imgPrefs.edit().putBoolean("show_images", true).apply()
+                Log.d("MyLocalLLM", "ChatScreen: 图片目录=$imageDirName, 共 ${imageUris.size} 张, moveToInternal=false")
             }
-            Log.d("MyLocalLLM", "ChatScreen: 图片目录=$imageDirName, 共 ${imageUris.size} 张, moveToInternal=$moveToInternal")
         }
     }
 
@@ -365,6 +374,8 @@ fun ChatScreen(inference: LlamaInference) {
                                     .clickable {
                                         if (!useInternalImages) return@clickable
                                         useInternalImages = false
+                                        // 重置移入标记，避免内部模式的“选择目录”置位后污染外部模式行为
+                                        moveToInternal = false
                                         imgPrefs.edit().putBoolean("image_source_internal", false).apply()
                                         // 外部目录尚未选择，清空列表避免显示内部图片
                                         imageUris = emptyList()
@@ -402,6 +413,26 @@ fun ChatScreen(inference: LlamaInference) {
                                     modifier = Modifier.padding(start = 4.dp)
                                 ) {
                                     Text("清理")
+                                }
+                            }
+                            // 移入新图片入口：内部目录模式下也可直接从外部目录追加移入，
+                            // 避免切回外部目录才能看到“移入应用目录”选项
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "移入新图片（追加到内部目录并删除原文件）",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Button(onClick = {
+                                    moveToInternal = true
+                                    dirPicker.launch(null)
+                                }) {
+                                    Text("选择目录")
                                 }
                             }
                         } else {
@@ -951,10 +982,11 @@ private fun moveImagesToInternal(context: Context, treeUri: Uri): List<Uri> {
             val dest = java.io.File(internalDir, name)
             // 同名文件直接覆盖
             if (dest.exists()) overwritten++
-            context.contentResolver.openInputStream(docUri)?.use { input ->
-                dest.outputStream().use { output -> input.copyTo(output) }
-                copied.add(dest)
-            }
+            // openInputStream 可能返回 null，显式抛错以便计入失败并留下日志
+            val input = context.contentResolver.openInputStream(docUri)
+                ?: throw java.io.IOException("openInputStream 返回 null: $docUri")
+            input.use { i -> dest.outputStream().use { output -> i.copyTo(output) } }
+            copied.add(dest)
         }.onFailure {
             Log.w("MyLocalLLM", "ChatScreen: 复制失败 $name", it)
         }
@@ -974,11 +1006,14 @@ private fun moveImagesToInternal(context: Context, treeUri: Uri): List<Uri> {
     }
     val failed = results.size - copied.size
     Log.d("MyLocalLLM", "ChatScreen: 追加到内部目录完成, 目录中共找到=${results.size}, 复制=${copied.size}, 其中覆盖同名=$overwritten, 失败=$failed, 删除原文件=$deleted")
-    Toast.makeText(
-        context,
-        "找到 ${results.size} 张，复制 ${copied.size} 张（覆盖同名 $overwritten 张），失败 $failed 张",
-        Toast.LENGTH_LONG
-    ).show()
+    // 本函数可能在 IO 线程执行，Toast 需切回主线程弹出
+    android.os.Handler(context.mainLooper).post {
+        Toast.makeText(
+            context,
+            "找到 ${results.size} 张，复制 ${copied.size} 张（覆盖同名 $overwritten 张），失败 $failed 张",
+            Toast.LENGTH_LONG
+        ).show()
+    }
 
     return copied.sortedBy { it.name }.map { Uri.fromFile(it) }
 }
